@@ -1,7 +1,6 @@
 dependencies:
   espressif/cmake_utilities:
-    component_hash: 
-      05165f30922b422b4b90c08845e6d449329b97370fbd06309803d8cb539d79e3
+    component_hash: 05165f30922b422b4b90c08845e6d449329b97370fbd06309803d8cb539d79e3
     dependencies:
     - name: idf
       require: private
@@ -11,8 +10,7 @@ dependencies:
       type: service
     version: 1.1.1
   espressif/tinyusb:
-    component_hash: 
-      7f73a4159dc95325ceaa4ade5e88734c4e1f5124746a3765cf61dc6157d78798
+    component_hash: 7f73a4159dc95325ceaa4ade5e88734c4e1f5124746a3765cf61dc6157d78798
     dependencies:
     - name: idf
       require: private
@@ -26,8 +24,7 @@ dependencies:
     - esp32p4
     version: 0.17.0~2
   espressif/usb_device_uac:
-    component_hash: 
-      13667b2253ee8ff633c9995b6a20eea791e598ea386f833a952410e31d3a53ff
+    component_hash: 13667b2253ee8ff633c9995b6a20eea791e598ea386f833a952410e31d3a53ff
     dependencies:
     - name: espressif/cmake_utilities
       registry_url: https://components.espressif.com

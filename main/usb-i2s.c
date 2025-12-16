@@ -2,13 +2,20 @@
 #include "usb_device_uac.h"
 #include "driver/i2s_std.h"
 #include "driver/gpio.h"
+#include <math.h>
+#include <string.h>
+#include "esp_log.h"
 
 i2s_chan_handle_t tx_handle;
 
 i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO, I2S_ROLE_MASTER);
 
+//TODO : adjust clock and slot config to match USB audio exactly
+// check current ticks and see how many samples should have been send to keep up, and how many were actually sent
+
 i2s_std_config_t std_cfg = {
-    .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(48000),
+    // still not exactly correctly matched, but closer
+    .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(47990), //the 48khz of the esp is faster than the 48khz of the pc by about 0.02% so use 47990 to compensate
     .slot_cfg = I2S_STD_MSB_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
     .gpio_cfg = {
         .mclk = I2S_GPIO_UNUSED,
@@ -24,18 +31,42 @@ i2s_std_config_t std_cfg = {
     },
 };
 
-static float volume_factor = 1.0; // default: full volume
+static volatile float volume_factor = 1.0f; // default: full volume (gain)
+static volatile bool muted = false;
+static const char *TAG = "usb-i2s";
+
+
+
 
 static esp_err_t uac_device_output_cb(uint8_t *buf, size_t len, void *arg)
 {
     int16_t *samples = (int16_t *)buf; // 16-bit audio
-    size_t sample_count = len / 2;     // 2 bytes per sample
+    size_t sample_count = len / sizeof(int16_t);
 
-    for(size_t i = 0; i < sample_count; i++) {
-        int32_t temp = (int32_t)samples[i] * volume_factor; // scale
-        if(temp > 32767) temp = 32767;
-        if(temp < -32768) temp = -32768;
-        samples[i] = (int16_t)temp;
+    /* If muted or gain is zero, write silence. Otherwise apply gain.
+       We operate on per-sample (int16_t) data; sample_count is number of int16 samples. */
+    if (muted || volume_factor <= 0.0f) {
+        memset(buf, 0, len);
+    } else {
+        float gain = volume_factor;
+        for (size_t i = 0; i < sample_count; i++) {
+            /* multiply sample by gain and clamp to int16 range */
+            // int diff = samples[i] - prev_sample;
+            
+            // if (diff > 100 || diff < -100) {
+            //     ESP_LOGI(TAG, "i%u: d%d, c%d, p%d", (unsigned)i, diff, (int)samples[i], prev_sample);
+            // }
+            
+            // prev_sample = samples[i];
+
+            int32_t temp = (int32_t)(samples[i] * gain);
+
+            if (temp > INT16_MAX) temp = INT16_MAX;
+            if (temp < INT16_MIN) temp = INT16_MIN;
+
+            samples[i] = (int16_t)temp;
+
+        }
     }
 
     size_t bytes_written = 0;
@@ -52,14 +83,27 @@ static esp_err_t uac_device_input_cb(uint8_t *buf, size_t len, size_t *bytes_rea
 
 static void uac_device_set_mute_cb(uint32_t mute, void *arg)
 {
+    muted = (mute != 0);
+    ESP_LOGI(TAG, "set_mute_cb: mute=%u", (unsigned)mute);
 }
 
 static void uac_device_set_volume_cb(uint32_t volume, void *arg)
 {
-    // Assuming volume is 0..255
-    volume_factor = (float)volume / 255.0f;  
-    if(volume_factor > 1.0f) volume_factor = 1.0f;
-    if(volume_factor < 0.0f) volume_factor = 0.0f;
+    /* Map USB 0..255 volume to a perceptual gain (linear in dB).
+       0 -> silence, 255 -> 0 dB (gain=1.0). We map linearly in dB
+       from min_db to 0dB so that perceived loudness is more natural. */
+    const float min_db = -80.0f; /* floor dB for zero-like */
+    if (volume == 0) {
+        volume_factor = 0.0f;
+        ESP_LOGI(TAG, "set_volume_cb: volume=0 -> mute-equivalent, gain=0");
+    } else {
+        float norm = (float)volume / 100.0f; /* 0..1 */
+        float db = min_db + norm * (0.0f - min_db); /* interp from min_db to 0dB */
+        volume_factor = powf(10.0f, db / 20.0f);
+        if (volume_factor > 1.0f) volume_factor = 1.0f;
+        if (volume_factor < 0.0f) volume_factor = 0.0f;
+        ESP_LOGI(TAG, "set_volume_cb: volume=%u -> db=%.2f dB -> gain=%.6f", (unsigned)volume, db, (double)volume_factor);
+    }
 }
 
 
