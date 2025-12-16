@@ -7,6 +7,8 @@
 #include "esp_log.h"
 #include <stdint.h>
 #include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 i2s_chan_handle_t tx_handle;
 
@@ -19,7 +21,7 @@ i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO, I2S_ROLE_M
 
 i2s_std_config_t std_cfg = {
     // still not exactly correctly matched, but closer
-    .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(48000), //the 48khz of the esp is faster than the 48khz of the pc by about 0.02% so use 47990 to compensate
+    .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(47995), //the 48khz of the esp is faster than the 48khz of the pc by about 0.02% so use 47990 to compensate
     .slot_cfg = I2S_STD_MSB_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
     .gpio_cfg = {
         .mclk = I2S_GPIO_UNUSED,
@@ -40,7 +42,16 @@ static volatile bool muted = false;
 static const char *TAG = "usb-i2s";
 
 /* Timestamp of last uac output callback (microseconds from esp_timer_get_time) */
-static int64_t last_output_cb_time_us = 0; 
+static int64_t last_output_cb_time_us = 0;
+
+/* Tuning request state. The USB callback will set these and the background
+   task will perform the actual I2S tuning using i2s_channel_tune_rate(). */
+static volatile bool tuning_requested = false;
+static volatile int32_t tuning_delta_mclk = 0;
+
+/* Background task prototype */
+static void i2s_tuning_task(void *arg);
+
 
 
 
@@ -65,6 +76,41 @@ static esp_err_t uac_device_output_cb(uint8_t *buf, size_t len, void *arg)
             if (fps_accum_us >= 1000000) { /* report once per second */
                 double avg_fps = (double)frames_accum * 1e6 / (double)fps_accum_us;
                 ESP_LOGI(TAG, "avg fps: %.2f", avg_fps);
+
+                /* If measured sample rate drifts from configured rate, schedule tuning.
+                   We use a small relative threshold to avoid jittery updates. */
+                double configured_rate = (double)std_cfg.clk_cfg.sample_rate_hz;
+                double rel_err = (avg_fps - configured_rate) / configured_rate;
+                const double REL_TOL = 1e-4; /* 0.01% threshold */
+                if (fabs(rel_err) > REL_TOL) {
+                    /* Query current MCLK and compute desired change (Hz). Use ADDSUB mode. */
+                    i2s_tuning_info_t info;
+                    esp_err_t qerr = i2s_channel_tune_rate(tx_handle, NULL, &info);
+                    if (qerr == ESP_OK) {
+                        double desired_mclk = (double)info.curr_mclk_hz * (avg_fps / configured_rate);
+                        int32_t delta = (int32_t)round(desired_mclk - (double)info.curr_mclk_hz);
+                        if (delta != 0) {
+                            tuning_delta_mclk = delta;
+                            tuning_requested = true;
+                            ESP_LOGI(TAG, "request tuning: avg_fps=%.2f configured=%.2f delta_mclk=%d", avg_fps, configured_rate, delta);
+                        }
+                    } else {
+                        ESP_LOGW(TAG, "could not query current I2S MCLK (err=%d), will request tuning anyway", qerr);
+                        /* schedule best-effort tuning using measured ratio and current configured sample rate */
+                        /* compute an approximate delta based on configured sample rate and known mclk multiple */
+                        /* Fallback: assume MCLK = configured_rate * default mclk_multiple (256) */
+                        const int default_mclk_mult = 256; /* assume mclk multiple 256 for fallback */
+                        int32_t assumed_curr_mclk = (int32_t)(configured_rate * (double)default_mclk_mult);
+                        double desired_mclk = (double)assumed_curr_mclk * (avg_fps / configured_rate);
+                        int32_t delta = (int32_t)round(desired_mclk - (double)assumed_curr_mclk);
+                        if (delta != 0) {
+                            tuning_delta_mclk = delta;
+                            tuning_requested = true;
+                            ESP_LOGI(TAG, "fallback request tuning: avg_fps=%.2f configured=%.2f delta_mclk=%d", avg_fps, configured_rate, delta);
+                        }
+                    }
+                }
+
                 frames_accum = 0;
                 fps_accum_us = 0;
             }
@@ -110,6 +156,52 @@ static esp_err_t uac_device_input_cb(uint8_t *buf, size_t len, size_t *bytes_rea
     return ESP_OK;
 }
 
+/* Background task that performs the I2S tuning when requested by the USB
+   audio callback. It tries to call i2s_channel_tune_rate directly; if tuning
+   requires stopping the channel it will stop/start it temporarily. */
+static void i2s_tuning_task(void *arg)
+{
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(500));
+        if (!tuning_requested) {
+            continue;
+        }
+
+        /* consume the request */
+        tuning_requested = false;
+        int32_t delta = tuning_delta_mclk;
+        if (delta == 0) {
+            ESP_LOGI(TAG, "tuning requested but delta is 0, skipping");
+            continue;
+        }
+
+        i2s_tuning_config_t cfg = {
+            .tune_mode = I2S_TUNING_MODE_ADDSUB,
+            .tune_mclk_val = delta,
+            .max_delta_mclk = 100000, /* clamp range in Hz */
+            .min_delta_mclk = -100000,
+        };
+
+        i2s_tuning_info_t result;
+        esp_err_t err = i2s_channel_tune_rate(tx_handle, &cfg, &result);
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "Tuning applied: curr_mclk=%d delta_mclk=%d water_mark=%u", result.curr_mclk_hz, result.delta_mclk_hz, result.water_mark);
+            continue;
+        }
+
+        /* If tuning failed due to running state or unsupported, try by stopping channel */
+        ESP_LOGW(TAG, "i2s_channel_tune_rate returned %d, attempting tuning with channel stop", err);
+        i2s_channel_disable(tx_handle);
+        err = i2s_channel_tune_rate(tx_handle, &cfg, &result);
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "Tuning applied after stopping channel: curr_mclk=%d delta_mclk=%d", result.curr_mclk_hz, result.delta_mclk_hz);
+        } else {
+            ESP_LOGE(TAG, "Tuning failed even after stopping channel: %d", err);
+        }
+        i2s_channel_enable(tx_handle);
+    }
+}
+
 static void uac_device_set_mute_cb(uint32_t mute, void *arg)
 {
     muted = (mute != 0);
@@ -151,4 +243,7 @@ void app_main(void)
 
     /* Before writing data, start the TX channel first */
     i2s_channel_enable(tx_handle);
+
+    /* Start background tuning task (checks tuning_requested) */
+    xTaskCreate(i2s_tuning_task, "i2s_tune", 2048, NULL, 5, NULL);
 }
