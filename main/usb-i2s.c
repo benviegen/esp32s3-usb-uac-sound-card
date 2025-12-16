@@ -5,6 +5,8 @@
 #include <math.h>
 #include <string.h>
 #include "esp_log.h"
+#include <stdint.h>
+#include "esp_timer.h"
 
 i2s_chan_handle_t tx_handle;
 
@@ -12,10 +14,12 @@ i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO, I2S_ROLE_M
 
 //TODO : adjust clock and slot config to match USB audio exactly
 // check current ticks and see how many samples should have been send to keep up, and how many were actually sent
+// https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/peripherals/i2s.html#_CPPv421i2s_channel_tune_rate17i2s_chan_handle_tPK19i2s_tuning_config_tP17i2s_tuning_info_t
+// use for tuning based on usb input rate
 
 i2s_std_config_t std_cfg = {
     // still not exactly correctly matched, but closer
-    .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(47990), //the 48khz of the esp is faster than the 48khz of the pc by about 0.02% so use 47990 to compensate
+    .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(48000), //the 48khz of the esp is faster than the 48khz of the pc by about 0.02% so use 47990 to compensate
     .slot_cfg = I2S_STD_MSB_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
     .gpio_cfg = {
         .mclk = I2S_GPIO_UNUSED,
@@ -35,6 +39,9 @@ static volatile float volume_factor = 1.0f; // default: full volume (gain)
 static volatile bool muted = false;
 static const char *TAG = "usb-i2s";
 
+/* Timestamp of last uac output callback (microseconds from esp_timer_get_time) */
+static int64_t last_output_cb_time_us = 0; 
+
 
 
 
@@ -42,6 +49,28 @@ static esp_err_t uac_device_output_cb(uint8_t *buf, size_t len, void *arg)
 {
     int16_t *samples = (int16_t *)buf; // 16-bit audio
     size_t sample_count = len / sizeof(int16_t);
+
+    /* Estimate incoming sample rate by measuring time between callbacks */
+    static int64_t fps_accum_us = 0;
+    static uint64_t frames_accum = 0;
+
+    int64_t now_us = esp_timer_get_time();
+    if (last_output_cb_time_us != 0) {
+        int64_t delta_us = now_us - last_output_cb_time_us;
+        if (delta_us > 0) {
+            size_t frames = sample_count / 2; /* stereo frames in this callback */
+            frames_accum += frames;
+            fps_accum_us += delta_us;
+
+            if (fps_accum_us >= 1000000) { /* report once per second */
+                double avg_fps = (double)frames_accum * 1e6 / (double)fps_accum_us;
+                ESP_LOGI(TAG, "avg fps: %.2f", avg_fps);
+                frames_accum = 0;
+                fps_accum_us = 0;
+            }
+        }
+    }
+    last_output_cb_time_us = now_us;
 
     /* If muted or gain is zero, write silence. Otherwise apply gain.
        We operate on per-sample (int16_t) data; sample_count is number of int16 samples. */
