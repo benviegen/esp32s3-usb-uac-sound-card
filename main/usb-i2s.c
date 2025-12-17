@@ -18,8 +18,8 @@ i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO, I2S_ROLE_M
 // use for tuning based on usb input rate
 
 i2s_std_config_t std_cfg = {
-    // still not exactly correctly matched, but closer
-    .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(48000), //the 48khz of the esp is faster than the 48khz of the pc by about 0.02% so use 47990 to compensate
+    // still not exactly correctly matched, but closer (depends on port)
+    .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(47995), //the 48khz of the esp is faster than the 48khz of the pc 
     .slot_cfg = I2S_STD_MSB_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
     .gpio_cfg = {
         .mclk = I2S_GPIO_UNUSED,
