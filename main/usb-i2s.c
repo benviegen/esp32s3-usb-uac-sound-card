@@ -121,7 +121,7 @@ static void uac_device_set_volume_cb(uint32_t volume, void *arg)
     /* Map USB 0..255 volume to a perceptual gain (linear in dB).
        0 -> silence, 255 -> 0 dB (gain=1.0). We map linearly in dB
        from min_db to 0dB so that perceived loudness is more natural. */
-    const float min_db = -80.0f; /* floor dB for zero-like */
+    const float min_db = -10.0f; /* floor dB for zero-like */
     if (volume == 0) {
         volume_factor = 0.0f;
         ESP_LOGI(TAG, "set_volume_cb: volume=0 -> mute-equivalent, gain=0");
